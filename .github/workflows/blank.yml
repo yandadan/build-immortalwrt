@@ -87,7 +87,7 @@ jobs:
           cat > /opt/imagebuilder/files/etc/uci-defaults/99-custom.sh << 'UCIEOF'
 #!/bin/sh
 # 修改默认 LAN IP
-uci set network.lan.ipaddr='192.168.8.1'
+uci set network.lan.ipaddr='192.168.2.1'
 uci commit network
 
 # 修改主机名与时区
