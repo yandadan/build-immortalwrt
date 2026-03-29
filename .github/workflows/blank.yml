@@ -1,4 +1,3 @@
-
 name: Build ImmortalWrt 24.10.4 x86_64 (ImageBuilder)
 
 on:
@@ -8,11 +7,7 @@ on:
   #   - cron: '0 2 1 * *'
 
 env:
-  # ===== 版本与平台 =====
   IWR_VERSION: "24.10.4"
-  IWR_BRANCH: "openwrt-24.10"
-  TARGET: "x86/64"
-  # ImageBuilder 官方下载地址
   IB_URL: "https://downloads.immortalwrt.org/releases/24.10.4/targets/x86/64/immortalwrt-imagebuilder-24.10.4-x86-64.Linux-x86_64.tar.zst"
   TZ: Asia/Shanghai
 
@@ -20,11 +15,11 @@ jobs:
   build:
     name: Build ImmortalWrt x86_64
     runs-on: ubuntu-22.04
-    timeout-minutes: 60   # ImageBuilder 通常 5~15 分钟即可完成
+    timeout-minutes: 60
 
     steps:
       # ----------------------------------------------------------------
-      # 1. 检出仓库（用于获取自定义文件）
+      # 1. 检出仓库
       # ----------------------------------------------------------------
       - name: 检出仓库
         uses: actions/checkout@v4
@@ -50,23 +45,17 @@ jobs:
       - name: 下载 ImmortalWrt ImageBuilder
         run: |
           mkdir -p /opt/imagebuilder
-          echo "正在下载 ImageBuilder..."
           wget -q --show-progress "$IB_URL" -O /tmp/ib.tar.zst
-          echo "解压中..."
           tar --zstd -xf /tmp/ib.tar.zst -C /opt/imagebuilder --strip-components=1
           echo "ImageBuilder 准备完毕"
-          ls /opt/imagebuilder
 
       # ----------------------------------------------------------------
       # 4. 下载第三方 ipk：OpenClash
-      #    （OpenClash 不在官方 feed，需单独下载）
       # ----------------------------------------------------------------
       - name: 下载 OpenClash ipk
         run: |
           mkdir -p /opt/imagebuilder/packages/third-party
 
-          # 获取 OpenClash 最新 Release 的下载地址
-          echo "获取 OpenClash 最新版本..."
           OPENCLASH_URL=$(curl -fsSL \
             "https://api.github.com/repos/vernesong/OpenClash/releases" \
             | grep "browser_download_url" \
@@ -75,74 +64,69 @@ jobs:
             | cut -d'"' -f4)
 
           if [ -z "$OPENCLASH_URL" ]; then
-            echo "::error::无法获取 OpenClash 下载地址，请检查网络"
+            echo "::error::无法获取 OpenClash 下载地址"
             exit 1
           fi
 
           echo "下载 OpenClash: $OPENCLASH_URL"
           wget -q --show-progress "$OPENCLASH_URL" \
             -O /opt/imagebuilder/packages/third-party/luci-app-openclash.ipk
-          echo "OpenClash 下载完成"
+
+          # 生成本地包索引
+          cd /opt/imagebuilder/packages/third-party
+          /opt/imagebuilder/staging_dir/host/bin/opkg-make-index . > Packages
+          gzip -9k Packages
 
       # ----------------------------------------------------------------
-      # 5. 复制自定义文件（files/ 目录会被打包进固件）
+      # 5. 准备自定义配置文件
       # ----------------------------------------------------------------
       - name: 准备自定义配置文件
         run: |
-          # 将仓库中的 files/ 目录复制到 ImageBuilder
-          if [ -d "$GITHUB_WORKSPACE/files" ]; then
-            cp -r "$GITHUB_WORKSPACE/files" /opt/imagebuilder/files
-            echo "自定义 files/ 目录已复制"
-          else
-            mkdir -p /opt/imagebuilder/files
-            echo "未检测到自定义 files/ 目录，跳过"
-          fi
-
-          # 写入开机初始化脚本（uci-defaults 在首次启动时执行一次）
           mkdir -p /opt/imagebuilder/files/etc/uci-defaults
+
           cat > /opt/imagebuilder/files/etc/uci-defaults/99-custom.sh << 'UCIEOF'
-          #!/bin/sh
-          # 修改默认 LAN IP
-          uci set network.lan.ipaddr='192.168.8.1'
-          uci commit network
+#!/bin/sh
+# 修改默认 LAN IP
+uci set network.lan.ipaddr='192.168.8.1'
+uci commit network
 
-          # 修改主机名
-          uci set system.@system[0].hostname='ImmortalWrt'
-          uci set system.@system[0].timezone='CST-8'
-          uci set system.@system[0].zonename='Asia/Shanghai'
-          uci commit system
+# 修改主机名与时区
+uci set system.@system[0].hostname='ImmortalWrt'
+uci set system.@system[0].timezone='CST-8'
+uci set system.@system[0].zonename='Asia/Shanghai'
+uci commit system
 
-          # 启用 SmartDNS
-          uci set smartdns.@smartdns[0].enabled='1'
-          uci set smartdns.@smartdns[0].port='6053'
-          uci set smartdns.@smartdns[0].bind_interface='lo'
-          uci commit smartdns
+# 启用 SmartDNS，监听本地 6053 端口
+uci set smartdns.@smartdns[0].enabled='1'
+uci set smartdns.@smartdns[0].port='6053'
+uci set smartdns.@smartdns[0].bind_interface='lo'
+uci commit smartdns
 
-          # 设置 SmartDNS 为 dnsmasq 上游
-          uci set dhcp.@dnsmasq[0].server='127.0.0.1#6053'
-          uci set dhcp.@dnsmasq[0].noresolv='1'
-          uci commit dhcp
+# 将 dnsmasq 上游指向 SmartDNS
+uci set dhcp.@dnsmasq[0].server='127.0.0.1#6053'
+uci set dhcp.@dnsmasq[0].noresolv='1'
+uci commit dhcp
 
-          exit 0
-          UCIEOF
+exit 0
+UCIEOF
           chmod +x /opt/imagebuilder/files/etc/uci-defaults/99-custom.sh
 
       # ----------------------------------------------------------------
       # 6. 构建固件
+      #    包列表说明：
+      #      - ipv6helper 在 24.10.x x86_64 中已不存在，
+      #        用 odhcp6c + odhcpd-ipv6only 替代
+      #      - -dnsmasq + dnsmasq-full：移除精简版，装完整版支持 ipset
+      #      - luci-app-openclash 来自上一步下载的本地 ipk
       # ----------------------------------------------------------------
       - name: 构建固件
         run: |
           cd /opt/imagebuilder
 
-          # 将第三方 ipk 加入本地仓库索引
-          echo "src imagebuilder file:packages/third-party" >> repositories.conf
+          # 将第三方包目录加入仓库列表（插在第一行，优先级最高）
+          sed -i '1s|^|src/gz third_party file:packages/third-party\n|' repositories.conf
 
-          # 定义要安装的包
-          # 说明：
-          #   - luci-app-adguardhome / luci-app-smartdns 在 ImmortalWrt 官方 feed 中已有
-          #   - luci-app-openclash 来自 third-party 本地目录
-          #   - -dnsmasq 移除默认 dnsmasq，安装 dnsmasq-full 以支持 ipset
-          PACKAGES="\
+          PACKAGES=" \
             -dnsmasq \
             dnsmasq-full \
             luci \
@@ -171,14 +155,12 @@ jobs:
             lsblk \
             block-mount \
             openssh-sftp-server \
-            ipv6helper \
+            odhcp6c \
+            odhcpd-ipv6only \
             luci-proto-ipv6 \
+            luci-proto-ppp \
             kmod-inet-diag \
           "
-
-          echo "开始构建固件，包含以下插件："
-          echo "$PACKAGES"
-          echo "---"
 
           make image \
             PROFILE="generic" \
@@ -187,36 +169,33 @@ jobs:
             EXTRA_IMAGE_NAME="custom" \
             2>&1 | tee /tmp/build.log
 
-          # 检查是否构建成功
-          if [ ! -d "bin/targets/x86/64" ] || \
-             [ -z "$(ls bin/targets/x86/64/*.img.gz 2>/dev/null)" ]; then
-            echo "::error::固件构建失败，请查看日志"
-            cat /tmp/build.log | tail -50
+          if [ -z "$(ls bin/targets/x86/64/*.img.gz 2>/dev/null)" ]; then
+            echo "::error::固件构建失败"
+            tail -60 /tmp/build.log
             exit 1
           fi
 
-          echo "✅ 固件构建成功！"
+          echo "✅ 固件构建成功"
           ls -lh bin/targets/x86/64/
           echo "FIRMWARE_PATH=/opt/imagebuilder/bin/targets/x86/64" >> "$GITHUB_ENV"
 
       # ----------------------------------------------------------------
-      # 7. 整理产物，只保留需要的镜像
+      # 7. 整理固件，只保留镜像文件
       # ----------------------------------------------------------------
       - name: 整理固件文件
         run: |
           cd "$FIRMWARE_PATH"
-          # 只保留以下四种镜像，删除其余
           find . -maxdepth 1 -type f ! \( \
             -name "*combined-efi*" \
             -o -name "*combined.img*" \
             -o -name "*sysupgrade*" \
             -o -name "sha256sums" \
           \) -delete
-          echo "最终固件文件："
+          echo "最终固件："
           ls -lh
 
       # ----------------------------------------------------------------
-      # 8. 上传到 Artifacts（7天有效）
+      # 8. 上传 Artifacts（7天有效）
       # ----------------------------------------------------------------
       - name: 上传固件到 Artifacts
         uses: actions/upload-artifact@v4
@@ -251,24 +230,18 @@ jobs:
             ### 预装插件
             - 🔀 **OpenClash**（科学上网）
             - 🛡 **AdGuard Home**（广告过滤）
-            - 🔍 **SmartDNS**（DNS 加速，端口 6053，已设为 dnsmasq 上游）
+            - 🔍 **SmartDNS**（DNS 加速，端口 6053，已配为 dnsmasq 上游）
 
-            ### 固件选择说明
+            ### 固件选择
             | 文件 | 用途 |
             |------|------|
-            | `*combined-efi*.img.gz` | 全新安装，**EFI 主板**（推荐现代机器）|
-            | `*combined.img.gz` | 全新安装，Legacy BIOS 主板 |
+            | `*combined-efi*.img.gz` | EFI 主板全新安装（推荐）|
+            | `*combined.img.gz` | Legacy BIOS 全新安装 |
             | `*sysupgrade*.img.gz` | 已有 ImmortalWrt 在线升级 |
-
-            ### SmartDNS + AdGuard 联动说明
-            - SmartDNS 运行在 `127.0.0.1:6053`
-            - dnsmasq 将上游 DNS 指向 SmartDNS
-            - 如需同时使用 AdGuard Home，建议将 AdGuard Home 监听端口改为 `3000`，
-              并在 SmartDNS 中配置 AdGuard Home 作为上游
           files: ${{ env.FIRMWARE_PATH }}/*
 
       # ----------------------------------------------------------------
-      # 10. 失败时上传完整日志便于排查
+      # 10. 失败时上传日志
       # ----------------------------------------------------------------
       - name: 上传构建日志（仅失败时）
         uses: actions/upload-artifact@v4
